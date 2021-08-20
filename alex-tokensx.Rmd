@@ -1,0 +1,202 @@
+---
+title: "Alex on Tokens.x"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Alex on Tokens.x
+
+This is the analysis of the tracing output obtained from a run of Alex on its `Tokens.x` example.
+
+### Closure evaluation
+
+Note that the dataset contains calls from many modules, not just Alex itself.
+
+```{r load, echo = FALSE}
+data  <- read_tsv( '/mnt/analysis/paks/alex-dyn-trace-valid.tsv'
+                 , lazy = FALSE
+                 # 30 c's at the end for the argument columns
+                 , col_types = "iicciiicccccccccccccccccccccccccccccc"
+                 )
+diffs <- select(filter(data, type == "argument diff"), !c("src address", "dst address", type, "thread id"))
+
+# helper
+parseFunId <- function (tibl) {
+  tibl %>%
+    mutate(
+      package = gsub("^(.+)_[A-Z].*$",                         "\\1", `function`, perl = TRUE),
+      module  = gsub("^.+_([A-Z]\\w*(?:\\.[A-Z]\\w*)*).*$",    "\\1", `function`, perl = TRUE),
+      binder  = gsub("^.+_[A-Z]\\w*(?:\\.[A-Z]\\w*)*\\.(.*)$", "\\1", `function`, perl = TRUE)
+    )
+}
+```
+
+```{r initial exploration, echo = FALSE}
+unique_call_signs <- diffs %>%
+  #select(!timestamp) %>%
+  #distinct(`function`, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9, arg10, arg11, arg12, arg13)
+  group_by(`function`, arity, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9, arg10, arg11, arg12, arg13) %>%
+  summarise(calls = n()) %>%
+  group_by(`function`)
+```
+
+How many function calls preserve laziness?
+```{r laziness-preserving calls}
+funcs_only <- unique_call_signs %>% filter(arity > 0)
+arg_cols   <- paste0("arg", 1:12)
+all_calls  <- sum(funcs_only$calls)
+
+# *ack* I gotta check how does if_all() behave with NAs :(
+lazy <- funcs_only %>%
+  filter(!if_any(all_of(arg_cols), \(x) grepl("->", x)) & !if_all(all_of(arg_cols), \(x) grepl("(con|<not pointery>)", x)))
+lazy_calls <- sum(lazy$calls)
+
+unboxed <- funcs_only %>%
+  filter(if_any(all_of(arg_cols), \(x) grepl("<not pointery>", x)))
+unboxed_calls <- sum(unboxed$calls)
+
+p <- \(n) prettyNum(n, big.mark = " ")
+report <- \(msg, n, m) show(paste0(round(100 * n / m, 2), "% ", msg, " (", p(n), " / ", p(m), ")"))
+report("of all calls are somewhat lazy", lazy_calls, all_calls)
+report("of all calls involve unboxed values or void", unboxed_calls, all_calls)
+```
+
+
+TODO:
+
+- [ ] find always-strict functions
+- [ ] find sometimes-strict functions
+- [ ] find a way to link that information back to the source code
+- [ ] which functions are primarily responsible for triggering evaluations?
+- [ ] which modules?
+
+```{r consistently strict functions}
+# consistently strict in the first argument: either triggers evaluation
+# or receives a constructor in the first place
+strictInArg1 <- funcs_only %>%
+  filter(any(grepl("(con|->)", arg1)))
+```
+
+```{r inconsistently strict functions}
+# inconsistently strict in the first argument
+########################################
+# FIXME: this ignores funs and paps,   #
+#        which is specific to this     #
+#        dataset                       #
+########################################
+is_thunk  <- \(c) any(c == "thunk")
+is_strict <- \(c) any(grepl("->", c))
+inconsistently_strict <- funcs_only %>%
+  filter(is_thunk (c_across(starts_with("arg")))) %>%
+  filter(is_strict(c_across(starts_with("arg"))))
+report("of all calls are to inconsistently strict functions", sum(inconsistently_strict$calls), all_calls)
+
+
+inconsistently_strict %>%
+  parseFunId() %>%
+  ungroup() %>%
+  group_by(package, module, binder) %>%
+  summarise(n = sum(calls)) %>%
+  arrange(., -n)
+
+# the top inconsistently strict function appears to be IntSet intersection
+focus <- function(m, n) {
+  c <- funcs_only %>%
+    ungroup() %>%
+    parseFunId() %>%
+    filter(grepl(m, module) & grepl(n, binder)) %>%
+    select(arity)
+  ar <- c[[1]][1]
+
+  funcs_only %>%
+    ungroup() %>%
+    parseFunId() %>%
+    filter(grepl(m, module, perl = TRUE) & grepl(n, binder, perl = TRUE)) %>%
+    select(!starts_with("arg"), num_range("arg", 1:ar)) %>%
+    select(!c(package, `function`, arity)) %>%
+    arrange(., -calls)
+}
+
+focus("", "lgo3.*EUD")
+```
+
+
+```{r modules responsible for evaluation}
+inconsistently_strict %>%
+  parseFunId() %>%
+  ungroup() %>%
+  select(!`function`) %>%
+  group_by(package, module) %>%
+  filter(if_any(all_of(arg_cols), \(x) grepl("->", x))) %>%
+  # FIXME: imprecise: if a call evaluates multiple arguments, only one is counted
+  summarise(evaluations = sum(calls)) %>%
+  arrange(., -evaluations)
+```
+
+
+```{r rarely lazy functions}
+# sum calls of the same laziness signature
+# and find functions which have more strict calls than lazy calls
+inconsistently_strict %>%
+  pivot_longer(starts_with("arg"), names_to = "position", names_pattern = "arg(\\d*)", values_to = "diff") %>%
+  filter(!is.na(diff)) %>%
+  group_by(`function`, arity, position, diff) %>%
+  summarise(n = sum(calls)) %>%
+  ungroup() %>%
+  parseFunId() %>%
+  select(!`function`) %>%
+  group_by(package, module, binder) %>%
+  # at the following step, the number of calls to a function is equivalent
+  # to the sum of the newly added diff columns in any of the function's rows
+  pivot_wider(names_from = diff, values_from = n) %>%
+  filter(thunk < `thunk->con`) %>%
+  ungroup() %>%
+  arrange(., -`thunk->con`)
+
+focus("", "wgo2_ssMk")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
