@@ -5,6 +5,10 @@ output: html_document
 
 ```{r setup, include=FALSE}
 library(tidyverse)
+library(ggplot2)
+# install.packages("plotly")
+library(plotly)
+
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
@@ -17,10 +21,17 @@ This is the analysis of the tracing output obtained from a run of Alex on its `T
 Note that the dataset contains calls from many modules, not just Alex itself.
 
 ```{r load, echo = FALSE}
-data  <- read_tsv( '/mnt/analysis/paks/alex-dyn-trace-valid.tsv'
+data  <- read_tsv( '/mnt/analysis/home/viluon/alex-dyn-trace-valid.tsv' #'/mnt/analysis/paks/alex-dyn-trace-valid.tsv'
                  , lazy = FALSE
                  # 30 c's at the end for the argument columns
-                 , col_types = "iicciiicccccccccccccccccccccccccccccc"
+                 , col_types = "iiccciiciicccccccccccccccccccccccccccccc"
+                 #                  ||||||
+                 #                  ||||++-- source & destination addresses (for update frames)
+                 #                  ||||
+                 #                  |||+---- result diff
+                 #                  ||+----- arity
+                 #                  |+------ closure lifetime
+                 #                  +------- closure type
                  )
 diffs <- select(filter(data, type == "argument diff"), !c("src address", "dst address", type, "thread id"))
 
@@ -64,6 +75,109 @@ report <- \(msg, n, m) show(paste0(round(100 * n / m, 2), "% ", msg, " (", p(n),
 report("of all calls are somewhat lazy", lazy_calls, all_calls)
 report("of all calls involve unboxed values or void", unboxed_calls, all_calls)
 ```
+
+What does closure evaluation produce?
+
+```{r result shapes}
+unique_result_shapes <- diffs %>%
+  # let's look at functions only
+  filter(arity > 0) %>%
+  mutate(`result atoms` = gsub("(\\w+)Atom \\d+", "\\1Atom", `result atoms`)) %>%
+  group_by(`result atoms`) %>%
+  summarise(n = n()) %>%
+  mutate(`result arity` = str_count(`result atoms`, ",") + 1) %>%
+  arrange(., -n)
+
+single_result_calls <- unique_result_shapes %>% filter(`result arity` == 1) %>% summarise(sum(n))
+report("of all calls produce a single value", single_result_calls, all_calls)
+
+shape_count <- \(shape) unique_result_shapes %>%
+    filter(grepl(shape, `result atoms`)) %>%
+    summarise(sum(n))
+
+report("of all calls end in a pointer to a constructor", shape_count("con"), all_calls)
+report("of all calls end in a pointer to a thunk", shape_count("thunk"), all_calls)
+```
+
+How long do closures live?
+
+```{r closure lifetimes}
+entries <- select(filter(data, type == "closure entry"), c(timestamp, "function", "closure type", lifetime))
+
+entries %>%
+  filter(`closure type` == "thunk") %>%
+  ggplot(., aes(x = lifetime)) +
+  geom_histogram() +
+  ggtitle("thunk lifetimes") +
+  xlim(0, 2000000) +
+  scale_x_continuous(labels = scales::label_comma()) +
+  scale_y_continuous(labels = scales::label_comma())
+
+entries %>%
+  filter(`closure type` != "thunk") %>%
+  ggplot(., aes(x = lifetime)) +
+  ggtitle("non-thunk lifetimes") +
+  geom_histogram() +
+  scale_x_continuous(labels = scales::label_comma()) +
+  scale_y_continuous(labels = scales::label_comma())
+
+hist = entries %>%
+  ggplot(aes(x = lifetime + 1, fill = `closure type`)) +
+  ggtitle("all lifetimes") +
+  geom_histogram() +
+  scale_x_continuous(labels = scales::label_comma(), trans = "log2") +
+  scale_y_continuous(labels = scales::label_comma())
+
+ggplotly(hist)
+
+tlifetime_counts =
+  entries %>%
+  filter(`closure type` == "thunk") %>%
+  group_by(lifetime) %>%
+  summarise(n = n())
+
+with_sum = tlifetime_counts %>%
+  mutate( sum = sum(tlifetime_counts$n)
+        , p = 100 * n / sum
+        ) %>%
+  arrange(-n)
+
+X = 4
+
+thunks_evaluated_within_X_steps = with_sum %>%
+  ungroup() %>%
+  filter(lifetime < X) %>%
+  summarise(n = sum(n))
+
+with_sum
+thunks_evaluated_within_X_steps
+
+report(paste("of thunks are evaluated within", X, "closure entries from the point of their creation"), thunks_evaluated_within_X_steps$n[1], with_sum$sum[1])
+```
+
+There are non-thunk closures with lifetimes close to 0. What are those?
+```{r short-lived closures}
+short_lived = select(filter(data, type == "closure entry"), c(timestamp, "function", "closure type", lifetime)) %>%
+  filter(lifetime < 8)
+
+short_lived %>%
+  ggplot(., aes(fill = `closure type`, x = `lifetime`)) +
+  ggtitle("Short-lived heap objects") +
+  geom_bar(position = "dodge") +
+  # scale_x_continuous(labels = scales::label_comma()) +
+  scale_y_continuous(labels = scales::label_comma())
+
+all_heap_objects = (data %>%
+  filter(type == "closure entry") %>%
+  summarise(n = n()))$n[1]
+
+young_paps_thunks = short_lived %>%
+  filter(lifetime < 3, `closure type` %in% c("thunk", "pap")) %>%
+  summarise(n = n())
+
+report("of all heap objects are paps and thunks with lifetimes < 3", young_paps_thunks$n[1], all_heap_objects)
+```
+
 
 
 TODO:
@@ -121,7 +235,7 @@ focus <- function(m, n) {
     arrange(., -calls)
 }
 
-focus("", "lgo3.*EUD")
+focus("", "unpackA")
 ```
 
 
