@@ -24,16 +24,19 @@ Note that the dataset contains calls from many modules, not just Alex itself.
 data  <- read_tsv( '/mnt/analysis/home/viluon/alex-dyn-trace-valid.tsv' #'/mnt/analysis/paks/alex-dyn-trace-valid.tsv'
                  , lazy = FALSE
                  # 30 c's at the end for the argument columns
-                 , col_types = "iiccciiciicccccccccccccccccccccccccccccc"
-                 #                  ||||||
-                 #                  ||||++-- source & destination addresses (for update frames)
-                 #                  ||||
+                 , col_types = "iiccciicicccccccccccccccccccccccccccccc"
+                 #                  |||||
+                 #                  |||||
+                 #                  ||||+--- allocation address
                  #                  |||+---- result diff
                  #                  ||+----- arity
                  #                  |+------ closure lifetime
                  #                  +------- closure type
                  )
-diffs <- select(filter(data, type == "argument diff"), !c("src address", "dst address", type, "thread id"))
+```
+
+```{r load_cont, echo=FALSE}
+diffs <- select(filter(data, type == "argument diff"), !c("address", "type", "thread id", "lifetime", "closure type"))
 
 # helper
 parseFunId <- function (tibl) {
@@ -55,7 +58,8 @@ unique_call_signs <- diffs %>%
   group_by(`function`)
 ```
 
-How many function calls preserve laziness?
+### How many function calls preserve laziness?
+
 ```{r laziness-preserving calls}
 funcs_only <- unique_call_signs %>% filter(arity > 0)
 arg_cols   <- paste0("arg", 1:12)
@@ -76,7 +80,7 @@ report("of all calls are somewhat lazy", lazy_calls, all_calls)
 report("of all calls involve unboxed values or void", unboxed_calls, all_calls)
 ```
 
-What does closure evaluation produce?
+### What does closure evaluation produce?
 
 ```{r result shapes}
 unique_result_shapes <- diffs %>%
@@ -99,7 +103,7 @@ report("of all calls end in a pointer to a constructor", shape_count("con"), all
 report("of all calls end in a pointer to a thunk", shape_count("thunk"), all_calls)
 ```
 
-How long do closures live?
+### How long do closures live?
 
 ```{r closure lifetimes}
 entries <- select(filter(data, type == "closure entry"), c(timestamp, "function", "closure type", lifetime))
@@ -155,7 +159,8 @@ thunks_evaluated_within_X_steps
 report(paste("of thunks are evaluated within", X, "closure entries from the point of their creation"), thunks_evaluated_within_X_steps$n[1], with_sum$sum[1])
 ```
 
-There are non-thunk closures with lifetimes close to 0. What are those?
+### Which heap objects are short-lived?
+
 ```{r short-lived closures}
 short_lived = select(filter(data, type == "closure entry"), c(timestamp, "function", "closure type", lifetime)) %>%
   filter(lifetime < 8)
@@ -175,10 +180,37 @@ young_paps_thunks = short_lived %>%
   filter(lifetime < 3, `closure type` %in% c("thunk", "pap")) %>%
   summarise(n = n())
 
-report("of all heap objects are paps and thunks with lifetimes < 3", young_paps_thunks$n[1], all_heap_objects)
+report("of entered heap objects are paps and thunks with lifetimes < 3", young_paps_thunks$n[1], all_heap_objects)
 ```
 
+### How are allocations spread out over time?
 
+```{r allocations over time}
+allocations <- data %>%
+  filter(`type` == "allocation") %>%
+  select(c("timestamp", "closure type", "address"))
+
+allocations %>%
+  ggplot(aes(fill = `closure type`, x = `timestamp`)) +
+  geom_histogram() +
+  scale_x_continuous(labels = scales::label_comma())
+```
+
+### Which heap objects are never evaluated?
+
+```{r unentered heap objects}
+allocated_thunks <- allocations %>%
+  filter(`closure type` == "thunk") %>%
+  summarise(n = n())
+
+entered_thunks <- entries %>%
+  filter(`closure type` == "thunk") %>%
+  summarise(n = n())
+
+report("of allocated thunks are entered", entered_thunks$n, allocated_thunks$n)
+```
+
+### What are the strictness properties of called functions?
 
 TODO:
 
